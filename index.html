@@ -155,6 +155,7 @@
         let explosionFactor = 0;
         let needsSettle = false;      // write one clean frame after an explosion ends
         let shakeIntensity = 0;
+        let fistStreak = 0, openStreak = 0;  // hysteresis to stop fist/open flicker ("breathing")
         let targetScale = 1;          // set by the two-hand "resize" gesture
         let starBaseSize = 0.4;
 
@@ -194,11 +195,11 @@
             // ratio keep the GPU cost down. preserveDrawingBuffer lets 📸 read the canvas.
             renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
             renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+            renderer.setPixelRatio(1); // render at CSS pixels (no retina supersampling) — big GPU win
             document.body.appendChild(renderer.domElement);
 
             // The planet: a sphere rebuilt out of glowing points
-            const saturnGeo = new THREE.SphereGeometry(4, 48, 48);
+            const saturnGeo = new THREE.SphereGeometry(4, 40, 40);
             const saturnMat = new THREE.PointsMaterial({ color: THEMES[0].saturn, size: 0.04 });
             saturn = new THREE.Points(saturnGeo, saturnMat);
             scene.add(saturn);
@@ -210,7 +211,7 @@
             }
 
             // The rings: a flat cloud of particles
-            const ringCount = 8000;
+            const ringCount = 6000;
             const ringGeo = new THREE.BufferGeometry();
             const rPositions = new Float32Array(ringCount * 3);
             for (let i = 0; i < ringCount; i++) {
@@ -268,9 +269,10 @@
                 composer = new THREE.EffectComposer(renderer);
                 composer.addPass(new THREE.RenderPass(scene, camera));
 
+                // Render bloom at half resolution — much cheaper, barely visible difference.
                 bloomPass = new THREE.UnrealBloomPass(
-                    new THREE.Vector2(window.innerWidth, window.innerHeight),
-                    1.1,   // strength
+                    new THREE.Vector2(window.innerWidth / 2, window.innerHeight / 2),
+                    0.9,   // strength
                     0.5,   // radius
                     0.0    // threshold (0 = everything glows a little)
                 );
@@ -468,7 +470,7 @@
                 } else if (allHands.length === 1) {
                     handleOneHand(allHands[0]);
                 } else {
-                    lastHandPos = null; isExploded = false;
+                    lastHandPos = null; isExploded = false; fistStreak = 0; openStreak = 0;
                 }
             });
 
@@ -501,7 +503,7 @@
             const dx = a[9].x - b[9].x, dy = a[9].y - b[9].y;
             const dist = Math.hypot(dx, dy);                 // ~0.1 (close) .. ~0.6 (wide)
             targetScale = THREE.MathUtils.clamp(0.5 + (dist - 0.1) * 3.0, 0.4, 2.4);
-            isExploded = false; lastHandPos = null;
+            isExploded = false; lastHandPos = null; fistStreak = 0; openStreak = 0;
         }
 
         // One hand → all the single-hand gestures.
@@ -510,23 +512,21 @@
             currentHandCenter.set(((1 - lm[9].x) - 0.5) * 15, -(lm[9].y - 0.5) * 10, 0);
 
             const thumbTip = lm[4], indexTip = lm[8];
-
-            // Pinch distance → zoom
-            const zoomDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
-            const targetZ = 35 - (zoomDist * 110);
-            camera.position.z = THREE.MathUtils.lerp(camera.position.z, THREE.MathUtils.clamp(targetZ, 5, 60), 0.1);
-
             const now = performance.now();
 
-            if (isPeace(lm) && now - lastThemeSwitch > 900) {
-                cycleTheme(); lastThemeSwitch = now; return;
-            }
-            if (isThumbsUp(lm) && now - lastReset > 900) {
-                resetView(); lastReset = now; return;
-            }
+            // Special gestures first
+            if (isPeace(lm) && now - lastThemeSwitch > 900) { cycleTheme(); lastThemeSwitch = now; return; }
+            if (isThumbsUp(lm) && now - lastReset > 900) { resetView(); lastReset = now; return; }
 
-            if (isHandFist(lm)) {
-                // Closed hand → grab and rotate
+            // Stable fist/open detection with hysteresis. The state only flips after a
+            // few consistent frames, so it can't rapidly toggle and make the planet
+            // "breathe". During the brief ambiguous window we keep the current state.
+            if (isHandFist(lm)) { fistStreak++; openStreak = 0; }
+            else { openStreak++; fistStreak = 0; }
+
+            if (fistStreak >= 3) {
+                // GRAB & ROTATE only — no zoom here, so a clenched fist holds the
+                // planet at a fixed size instead of bobbing in and out.
                 isExploded = false;
                 if (lastHandPos) {
                     const ddx = (1 - indexTip.x) - (1 - lastHandPos.x);
@@ -535,8 +535,11 @@
                     rings.rotation.y += ddx * 7; rings.rotation.x += ddy * 7;
                 }
                 lastHandPos = indexTip;
-            } else {
-                // Open hand → scatter and follow
+            } else if (openStreak >= 3) {
+                // OPEN HAND → scatter/follow, plus pinch-to-zoom (only while open).
+                const zoomDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+                const targetZ = THREE.MathUtils.clamp(35 - zoomDist * 110, 5, 60);
+                camera.position.z = THREE.MathUtils.lerp(camera.position.z, targetZ, 0.08);
                 if (!isExploded) playBoom();   // sound on the moment of explosion
                 isExploded = true; lastHandPos = null;
             }
@@ -670,7 +673,7 @@
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
             if (composer) composer.setSize(window.innerWidth, window.innerHeight);
-            if (bloomPass) bloomPass.setSize(window.innerWidth, window.innerHeight);
+            if (bloomPass) bloomPass.setSize(window.innerWidth / 2, window.innerHeight / 2);
         });
     </script>
 </body>
