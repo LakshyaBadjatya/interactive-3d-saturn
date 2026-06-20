@@ -4,6 +4,8 @@
 
 Built with **Three.js** for the 3D graphics and **Google MediaPipe Hands** for real-time hand tracking — running entirely in the browser, with nothing to install.
 
+**🔴 Live demo:** https://lakshyabadjatya.github.io/interactive-3d-saturn/
+
 ![Saturn glowing in space](screenshots/01-hero.png)
 
 ---
@@ -68,7 +70,7 @@ Because it uses your webcam, browsers require the page to be served over `http:/
 ```bash
 python3 -m http.server 8000
 ```
-Then open <http://localhost:8000/my-saturn.html> in your browser.
+Then open <http://localhost:8000/index.html> in your browser.
 
 **Option 2 — Node (if you have it):**
 ```bash
