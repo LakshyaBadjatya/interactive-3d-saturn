@@ -1,0 +1,32 @@
+# ---- Claude / AI assistant files (never published) ----
+.claude/
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.cursorrules
+memory/
+**/*.session.json
+
+# ---- Internal docs / scratch (not part of the published app) ----
+docs/
+notes/
+*.draft.md
+TODO.md
+
+# ---- Reference material (original page this project was based on) ----
+test17.html
+
+# ---- Tooling / test artifacts ----
+.playwright-mcp/
+*.log
+.cache/
+
+# ---- Dependencies ----
+node_modules/
+
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
