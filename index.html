@@ -14,7 +14,7 @@
     <!-- Three.js core -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 
-    <!-- Three.js post-processing (for the glow / bloom effect). Loaded in dependency order. -->
+    <!-- Three.js post-processing (the glow / bloom effect). Loaded in dependency order. -->
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
@@ -72,20 +72,22 @@
         /* Bottom-left toolbar (works without a webcam too) */
         #toolbar {
             position: absolute; bottom: 14px; left: 14px; z-index: 15;
-            display: flex; gap: 8px; flex-wrap: wrap;
+            display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
         }
         .btn {
             background: rgba(0, 25, 40, 0.6); backdrop-filter: blur(6px);
             border: 1px solid rgba(0, 220, 255, 0.4); color: var(--accent);
             border-radius: 10px; padding: 9px 12px; cursor: pointer;
             font-size: 0.95rem; transition: all 0.18s ease; user-select: none;
+            white-space: nowrap;
         }
         .btn:hover { background: rgba(0, 220, 255, 0.18); transform: translateY(-2px); }
         .btn:active { transform: translateY(0); }
+        #btn-gfx { font-size: 0.8rem; font-weight: 600; }
 
-        /* Transient toast (theme name, reset, etc.) */
+        /* Transient toast (theme name, quality, reset, etc.) */
         #toast {
-            position: absolute; top: 24px; left: 50%; transform: transl(-50%, -10px);
+            position: absolute; top: 24px; left: 50%;
             transform: translateX(-50%) translateY(-10px);
             background: rgba(0, 25, 40, 0.7); border: 1px solid rgba(0, 220, 255, 0.4);
             color: var(--accent); padding: 8px 18px; border-radius: 30px;
@@ -111,11 +113,12 @@
             <li>🙌 <b>Two hands</b> — pull apart / together to resize</li>
         </ul>
         <div style="margin-top:8px; opacity:0.8;">
+            Running slow? Use the <b>GFX</b> button to drop to a lower graphics mode.<br>
             No webcam? Use the buttons below, or drag with the mouse and scroll to zoom.<br>
-            Keys: <span class="key">H</span> help · <span class="key">C</span> colour ·
-            <span class="key">T</span> trails · <span class="key">M</span> mute ·
-            <span class="key">R</span> reset · <span class="key">F</span> fullscreen ·
-            <span class="key">P</span> screenshot
+            Keys: <span class="key">G</span> graphics · <span class="key">H</span> help ·
+            <span class="key">C</span> colour · <span class="key">T</span> trails ·
+            <span class="key">M</span> mute · <span class="key">R</span> reset ·
+            <span class="key">F</span> fullscreen · <span class="key">P</span> screenshot
         </div>
     </div>
 
@@ -123,6 +126,7 @@
     <div id="toast"></div>
 
     <div id="toolbar">
+        <button class="btn" id="btn-gfx"    title="Graphics quality: Low / Mid / High (G)">GFX: Mid</button>
         <button class="btn" id="btn-color"  title="Change colour theme (C)">🎨</button>
         <button class="btn" id="btn-trails" title="Toggle particle trails (T)">✨</button>
         <button class="btn" id="btn-mute"   title="Mute / unmute (M)">🔊</button>
@@ -149,18 +153,47 @@
         let lastHandPos = null;
         let currentHandCenter = new THREE.Vector3(0, 0, 0);
         let handActive = false;       // is at least one hand currently visible?
+        let hands = null;             // the MediaPipe Hands instance (set in startApp)
 
         // --- Animation / interaction state ---
         let isExploded = false;
         let explosionFactor = 0;
         let needsSettle = false;      // write one clean frame after an explosion ends
         let shakeIntensity = 0;
-        let fistStreak = 0, openStreak = 0;  // hysteresis to stop fist/open flicker ("breathing")
         let targetScale = 1;          // set by the two-hand "resize" gesture
         let starBaseSize = 0.4;
+        let fistStreak = 0, openStreak = 0;  // hysteresis to stop fist/open flicker
 
         // --- Cached original particle positions + random scatter directions ---
         let saturnOrigPos = [], ringOrigPos = [], saturnRandomDirs = [], ringRandomDirs = [];
+
+        // =====================================================================
+        //  GRAPHICS QUALITY PRESETS  (Low / Mid / High)
+        //  Lets low-end machines run smoothly and high-end machines look great.
+        // =====================================================================
+        const QUALITY = {
+            low:  { label: 'Low',  pr: 0.7, bloom: false, bloomRes: 0.5, bloomStr: 0.0,
+                    sphereSeg: 24, rings: 2500,  stars: 1200, hands: 1, model: 0, procEvery: 2 },
+            mid:  { label: 'Mid',  pr: 1.0, bloom: true,  bloomRes: 0.5, bloomStr: 0.9,
+                    sphereSeg: 40, rings: 6000,  stars: 3000, hands: 2, model: 0, procEvery: 1 },
+            high: { label: 'High', pr: Math.min(window.devicePixelRatio || 1, 1.5), bloom: true, bloomRes: 1.0, bloomStr: 1.1,
+                    sphereSeg: 64, rings: 11000, stars: 4000, hands: 2, model: 1, procEvery: 1 },
+        };
+        let currentQuality = 'mid';
+        let useBloom = true;
+        let currentBloomRes = 0.5;
+        let procEvery = 1, procCounter = 0;   // process every Nth webcam frame (low mode skips)
+
+        // Guess a sensible starting quality from the device.
+        function autoQuality() {
+            const ua = navigator.userAgent || '';
+            const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+            const cores = navigator.hardwareConcurrency || 4;
+            const mem = navigator.deviceMemory || 4;
+            if (mobile || cores <= 4 || mem <= 2) return 'low';
+            if (cores <= 8) return 'mid';
+            return 'high';
+        }
 
         // --- Colour themes (cycled with the peace sign, the 🎨 button, or "C") ---
         const THEMES = [
@@ -183,27 +216,17 @@
 
 
         // =====================================================================
-        //  SCENE SETUP
+        //  PARTICLE BUILDERS (rebuilt when graphics quality changes)
         // =====================================================================
-        function initThree() {
-            scene = new THREE.Scene();
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            camera.position.z = 12;
-            scene.add(camera);
-
-            // antialias off (the bloom pass smooths edges anyway) and a capped pixel
-            // ratio keep the GPU cost down. preserveDrawingBuffer lets 📸 read the canvas.
-            renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(1); // render at CSS pixels (no retina supersampling) — big GPU win
-            document.body.appendChild(renderer.domElement);
+        function buildSaturnRings(q) {
+            if (saturn) { scene.remove(saturn); saturn.geometry.dispose(); saturn.material.dispose(); }
+            if (rings)  { scene.remove(rings);  rings.geometry.dispose();  rings.material.dispose();  }
+            saturnOrigPos = []; saturnRandomDirs = []; ringOrigPos = []; ringRandomDirs = [];
 
             // The planet: a sphere rebuilt out of glowing points
-            const saturnGeo = new THREE.SphereGeometry(4, 40, 40);
-            const saturnMat = new THREE.PointsMaterial({ color: THEMES[0].saturn, size: 0.04 });
-            saturn = new THREE.Points(saturnGeo, saturnMat);
+            const saturnGeo = new THREE.SphereGeometry(4, q.sphereSeg, q.sphereSeg);
+            saturn = new THREE.Points(saturnGeo, new THREE.PointsMaterial({ color: THEMES[themeIndex].saturn, size: 0.04 }));
             scene.add(saturn);
-
             const sPos = saturn.geometry.attributes.position.array;
             for (let i = 0; i < sPos.length; i += 3) {
                 saturnOrigPos.push(sPos[i], sPos[i + 1], sPos[i + 2]);
@@ -211,31 +234,54 @@
             }
 
             // The rings: a flat cloud of particles
-            const ringCount = 6000;
             const ringGeo = new THREE.BufferGeometry();
-            const rPositions = new Float32Array(ringCount * 3);
-            for (let i = 0; i < ringCount; i++) {
+            const rPositions = new Float32Array(q.rings * 3);
+            for (let i = 0; i < q.rings; i++) {
                 const r = 6.5 + Math.random() * 3.5;
                 const a = Math.random() * Math.PI * 2;
-                const x = Math.cos(a) * r;
-                const y = (Math.random() - 0.5) * 0.1;
-                const z = Math.sin(a) * r;
+                const x = Math.cos(a) * r, y = (Math.random() - 0.5) * 0.1, z = Math.sin(a) * r;
                 rPositions[i * 3] = x; rPositions[i * 3 + 1] = y; rPositions[i * 3 + 2] = z;
                 ringOrigPos.push(x, y, z);
                 ringRandomDirs.push((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
             }
             ringGeo.setAttribute('position', new THREE.BufferAttribute(rPositions, 3));
-            rings = new THREE.Points(ringGeo, new THREE.PointsMaterial({ color: THEMES[0].ring, size: 0.025, transparent: true, opacity: 0.6 }));
+            rings = new THREE.Points(ringGeo, new THREE.PointsMaterial({ color: THEMES[themeIndex].ring, size: 0.025, transparent: true, opacity: 0.6 }));
             rings.rotation.x = Math.PI / 3;
             scene.add(rings);
+        }
 
-            // Background starfield
+        function buildStars(q) {
+            if (stars) { scene.remove(stars); stars.geometry.dispose(); stars.material.dispose(); }
             const starGeo = new THREE.BufferGeometry();
-            const starPos = new Float32Array(4000 * 3);
-            for (let i = 0; i < 4000 * 3; i++) starPos[i] = (Math.random() - 0.5) * 1000;
+            const starPos = new Float32Array(q.stars * 3);
+            for (let i = 0; i < q.stars * 3; i++) starPos[i] = (Math.random() - 0.5) * 1000;
             starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
             stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: starBaseSize }));
             scene.add(stars);
+        }
+
+
+        // =====================================================================
+        //  SCENE SETUP
+        // =====================================================================
+        function initThree() {
+            const q = QUALITY[currentQuality];
+            useBloom = q.bloom; currentBloomRes = q.bloomRes; procEvery = q.procEvery;
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 12;
+            scene.add(camera);
+
+            // antialias off (bloom smooths edges) + a quality-driven pixel ratio.
+            // preserveDrawingBuffer lets the 📸 screenshot button read the canvas.
+            renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(q.pr);
+            document.body.appendChild(renderer.domElement);
+
+            buildSaturnRings(q);
+            buildStars(q);
 
             // Hand skeletons (two, so two-handed gestures show both)
             for (let h = 0; h < 2; h++) {
@@ -262,35 +308,70 @@
         // post-processing scripts didn't load.
         function setupPostProcessing() {
             if (typeof THREE.EffectComposer === 'undefined' || typeof THREE.UnrealBloomPass === 'undefined') {
-                composer = null;
-                return;
+                composer = null; useBloom = false; return;
             }
             try {
+                const q = QUALITY[currentQuality];
                 composer = new THREE.EffectComposer(renderer);
                 composer.addPass(new THREE.RenderPass(scene, camera));
 
-                // Render bloom at half resolution — much cheaper, barely visible difference.
                 bloomPass = new THREE.UnrealBloomPass(
-                    new THREE.Vector2(window.innerWidth / 2, window.innerHeight / 2),
-                    0.9,   // strength
-                    0.5,   // radius
-                    0.0    // threshold (0 = everything glows a little)
+                    new THREE.Vector2(window.innerWidth * q.bloomRes, window.innerHeight * q.bloomRes),
+                    q.bloomStr, 0.5, 0.0
                 );
                 composer.addPass(bloomPass);
 
                 // Trails are optional — keep bloom working even if this pass can't load.
                 try {
                     if (typeof THREE.AfterimagePass !== 'undefined') {
-                        afterimagePass = new THREE.AfterimagePass(0.92); // particle trails
-                        afterimagePass.enabled = false;                  // off by default
+                        afterimagePass = new THREE.AfterimagePass(0.92);
+                        afterimagePass.enabled = false;   // off by default
                         composer.addPass(afterimagePass);
                     }
-                } catch (e) {
-                    afterimagePass = null;
-                }
+                } catch (e) { afterimagePass = null; }
             } catch (e) {
-                composer = null;
+                composer = null; useBloom = false;
             }
+        }
+
+
+        // =====================================================================
+        //  GRAPHICS QUALITY SWITCHING
+        // =====================================================================
+        function setQuality(key) {
+            if (!QUALITY[key]) return;
+            currentQuality = key;
+            const q = QUALITY[key];
+
+            renderer.setPixelRatio(q.pr);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            useBloom = q.bloom;
+            currentBloomRes = q.bloomRes;
+            if (bloomPass) {
+                bloomPass.strength = q.bloomStr;
+                bloomPass.setSize(window.innerWidth * q.bloomRes, window.innerHeight * q.bloomRes);
+            }
+            if (composer) composer.setSize(window.innerWidth, window.innerHeight);
+
+            buildSaturnRings(q);
+            buildStars(q);
+            applyTheme(themeIndex);
+            needsSettle = true;
+
+            procEvery = q.procEvery;
+            if (hands) {
+                hands.setOptions({ maxNumHands: q.hands, modelComplexity: q.model,
+                                   minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+            }
+
+            const btn = document.getElementById('btn-gfx');
+            if (btn) btn.textContent = 'GFX: ' + q.label;
+            showToast('🖥️ Graphics: ' + q.label);
+        }
+        function cycleQuality() {
+            const order = ['low', 'mid', 'high'];
+            setQuality(order[(order.indexOf(currentQuality) + 1) % order.length]);
         }
 
 
@@ -330,15 +411,13 @@
             const targetFactor = isExploded ? 8.0 : 0;
             explosionFactor = THREE.MathUtils.lerp(explosionFactor, targetFactor, isExploded ? 0.04 : 0.18);
 
-            // When a real hand is driving it, particles are attracted to the palm.
             let attract = new THREE.Vector3();
             const useAttract = isExploded && handActive;
             if (useAttract) { attract.copy(currentHandCenter); handGroups[0].group.localToWorld(attract); }
 
-            // Only rewrite the 16k particle positions while something is actually
-            // moving. At rest we skip the loops entirely (no GPU re-upload) — this
-            // is the main fix for idle lag. One extra frame is written after settling
-            // so the particles land exactly back on the sphere.
+            // Only rewrite particle positions while something is moving; at rest we
+            // skip the loops (no GPU re-upload). One extra "settle" frame is written
+            // after motion stops so the particles land exactly on the sphere.
             const animating = isExploded || explosionFactor > 0.002 || needsSettle;
             if (animating) {
                 for (let i = 0; i < sAttr.count; i++) {
@@ -369,7 +448,6 @@
                 }
                 rAttr.needsUpdate = true;
 
-                // Remember to write one clean "settled" frame once we stop exploding.
                 needsSettle = isExploded || explosionFactor > 0.002;
             }
 
@@ -377,7 +455,7 @@
             const s = THREE.MathUtils.lerp(saturn.scale.x, targetScale, 0.12);
             saturn.scale.setScalar(s); rings.scale.setScalar(s);
 
-            // Camera shake from the "push" shockwave
+            // Camera shake from the "explosion" shockwave
             if (shakeIntensity > 0.02) {
                 camera.position.x += (Math.random() - 0.5) * shakeIntensity;
                 camera.position.y += (Math.random() - 0.5) * shakeIntensity;
@@ -407,7 +485,8 @@
                 stars.material.size = starBaseSize + Math.sin(performance.now() * 0.001) * 0.12;
             }
 
-            if (composer) composer.render(); else renderer.render(scene, camera);
+            if (composer && useBloom) composer.render();
+            else renderer.render(scene, camera);
             updateFps();
         }
 
@@ -415,8 +494,7 @@
             frameCount++;
             const now = performance.now();
             if (now - fpsTime >= 500) {
-                const fps = Math.round((frameCount * 1000) / (now - fpsTime));
-                document.getElementById('fps').textContent = fps + ' FPS';
+                document.getElementById('fps').textContent = Math.round((frameCount * 1000) / (now - fpsTime)) + ' FPS';
                 frameCount = 0; fpsTime = now;
             }
         }
@@ -432,23 +510,22 @@
         ];
 
         async function startApp() {
+            currentQuality = autoQuality();   // pick a starting quality for this device
             initThree();
             wireUpControls();
 
             const videoElement = document.getElementById('input-video');
             const loadingMsg = document.getElementById('loading-msg');
+            const q = QUALITY[currentQuality];
 
-            const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
-            // modelComplexity 0 = the "lite" model: much lighter on the CPU/GPU,
-            // which is the single biggest win for smoothness.
-            hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+            hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+            hands.setOptions({ maxNumHands: q.hands, modelComplexity: q.model, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
 
             hands.onResults((results) => {
                 if (loadingMsg) loadingMsg.style.display = 'none';
                 const allHands = results.multiHandLandmarks || [];
                 handActive = allHands.length > 0;
 
-                // Draw every detected hand's skeleton
                 handGroups.forEach((hg, idx) => {
                     if (idx < allHands.length) {
                         const lm = allHands[idx];
@@ -465,28 +542,27 @@
                     }
                 });
 
-                if (allHands.length >= 2) {
-                    handleTwoHands(allHands[0], allHands[1]);
-                } else if (allHands.length === 1) {
-                    handleOneHand(allHands[0]);
-                } else {
-                    lastHandPos = null; isExploded = false; fistStreak = 0; openStreak = 0;
-                }
+                if (allHands.length >= 2) handleTwoHands(allHands[0], allHands[1]);
+                else if (allHands.length === 1) handleOneHand(allHands[0]);
+                else { lastHandPos = null; isExploded = false; fistStreak = 0; openStreak = 0; }
             });
 
-            // Prefer MediaPipe's Camera helper; fall back to raw getUserMedia.
+            // Process every Nth webcam frame (low mode skips frames to save CPU).
+            const sendFrame = async () => {
+                procCounter = (procCounter + 1) % procEvery;
+                if (procCounter !== 0) return;
+                await hands.send({ image: videoElement });
+            };
+
             if (typeof Camera !== 'undefined') {
-                new Camera(videoElement, {
-                    onFrame: async () => { await hands.send({ image: videoElement }); },
-                    width: 640, height: 480
-                }).start();
+                new Camera(videoElement, { onFrame: sendFrame, width: 640, height: 480 }).start();
             } else {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
                     videoElement.srcObject = stream;
                     videoElement.onloadedmetadata = () => {
                         videoElement.play();
-                        const loop = async () => { await hands.send({ image: videoElement }); requestAnimationFrame(loop); };
+                        const loop = async () => { await sendFrame(); requestAnimationFrame(loop); };
                         loop();
                     };
                 } catch (err) {
@@ -500,36 +576,28 @@
 
         // Two hands → resize the planet by spreading them apart / together.
         function handleTwoHands(a, b) {
-            const dx = a[9].x - b[9].x, dy = a[9].y - b[9].y;
-            const dist = Math.hypot(dx, dy);                 // ~0.1 (close) .. ~0.6 (wide)
+            const dist = Math.hypot(a[9].x - b[9].x, a[9].y - b[9].y);   // ~0.1 .. ~0.6
             targetScale = THREE.MathUtils.clamp(0.5 + (dist - 0.1) * 3.0, 0.4, 2.4);
             isExploded = false; lastHandPos = null; fistStreak = 0; openStreak = 0;
         }
 
         // One hand → all the single-hand gestures.
         function handleOneHand(lm) {
-            // Palm centre for the "particles follow me" attraction
             currentHandCenter.set(((1 - lm[9].x) - 0.5) * 15, -(lm[9].y - 0.5) * 10, 0);
-
             const thumbTip = lm[4], indexTip = lm[8];
             const now = performance.now();
 
-            // Special gestures first
             if (isPeace(lm) && now - lastThemeSwitch > 900) { cycleTheme(); lastThemeSwitch = now; return; }
             if (isThumbsUp(lm) && now - lastReset > 900) { resetView(); lastReset = now; return; }
 
-            // Stable fist/open detection with hysteresis. The state only flips after a
-            // few consistent frames, so it can't rapidly toggle and make the planet
-            // "breathe". During the brief ambiguous window we keep the current state.
+            // Hysteresis: the state only flips after a few consistent frames, so it
+            // can't rapidly toggle (which made the planet "breathe").
             if (isHandFist(lm)) { fistStreak++; openStreak = 0; }
             else { openStreak++; fistStreak = 0; }
 
             if (fistStreak >= 3) {
-                // GRAB & ROTATE only (no zoom, so the planet holds a fixed size).
-                // Drive rotation from the PALM (landmark 9), which stays steady when
-                // the hand is clenched — the index tip is curled and noisy, which was
-                // making the planet jitter. A dead-zone ignores tiny hand tremor and a
-                // gentler gain keeps the rotation smooth.
+                // GRAB & ROTATE only. Driven by the PALM (steady when clenched); the
+                // index tip is curled and noisy. A dead-zone ignores tiny tremor.
                 isExploded = false;
                 const palmX = 1 - lm[9].x, palmY = lm[9].y;
                 if (lastHandPos) {
@@ -546,7 +614,7 @@
                 const zoomDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
                 const targetZ = THREE.MathUtils.clamp(35 - zoomDist * 110, 5, 60);
                 camera.position.z = THREE.MathUtils.lerp(camera.position.z, targetZ, 0.08);
-                if (!isExploded) playBoom();   // sound on the moment of explosion
+                if (!isExploded) playBoom();
                 isExploded = true; lastHandPos = null;
             }
         }
@@ -561,8 +629,7 @@
             saturn.material.color.setHex(t.saturn);
             rings.material.color.setHex(t.ring);
             handGroups.forEach(hg => { hg.skeleton.material.color.setHex(t.skel); hg.points.material.color.setHex(t.pts); });
-            const css = '#' + t.ring.toString(16).padStart(6, '0');
-            document.documentElement.style.setProperty('--accent', css);
+            document.documentElement.style.setProperty('--accent', '#' + t.ring.toString(16).padStart(6, '0'));
         }
         function cycleTheme() { applyTheme(themeIndex + 1); showToast('🎨 ' + THEMES[themeIndex].name); playBlip(); }
 
@@ -613,6 +680,7 @@
         }
         function toggleTrails() {
             if (!afterimagePass) { showToast('Trails unavailable'); return; }
+            if (!useBloom) { showToast('Trails need Mid/High graphics'); return; }
             afterimagePass.enabled = !afterimagePass.enabled;
             showToast(afterimagePass.enabled ? '✨ Trails on' : 'Trails off');
         }
@@ -624,9 +692,10 @@
         function toggleHelp() { document.getElementById('help').classList.toggle('hidden'); }
 
         function wireUpControls() {
-            // Auto-hide the help panel after a few seconds
+            document.getElementById('btn-gfx').textContent = 'GFX: ' + QUALITY[currentQuality].label;
             setTimeout(() => document.getElementById('help').classList.add('hidden'), 9000);
 
+            document.getElementById('btn-gfx').onclick    = cycleQuality;
             document.getElementById('btn-color').onclick  = () => { ensureAudio(); cycleTheme(); };
             document.getElementById('btn-trails').onclick = toggleTrails;
             document.getElementById('btn-mute').onclick   = () => { ensureAudio(); toggleMute(); };
@@ -635,10 +704,10 @@
             document.getElementById('btn-full').onclick   = toggleFullscreen;
             document.getElementById('btn-help').onclick   = toggleHelp;
 
-            // Keyboard shortcuts
             window.addEventListener('keydown', (e) => {
                 ensureAudio();
                 switch (e.key.toLowerCase()) {
+                    case 'g': cycleQuality(); break;
                     case 'c': cycleTheme(); break;
                     case 't': toggleTrails(); break;
                     case 'm': toggleMute(); break;
@@ -656,8 +725,7 @@
             window.addEventListener('pointerup', () => dragging = false);
             window.addEventListener('pointermove', (e) => {
                 if (!dragging || handActive) return;
-                const dx = (e.clientX - px) / window.innerWidth;
-                const dy = (e.clientY - py) / window.innerHeight;
+                const dx = (e.clientX - px) / window.innerWidth, dy = (e.clientY - py) / window.innerHeight;
                 saturn.rotation.y += dx * 5; saturn.rotation.x += dy * 5;
                 rings.rotation.y += dx * 5; rings.rotation.x += dy * 5;
                 px = e.clientX; py = e.clientY;
@@ -679,7 +747,7 @@
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
             if (composer) composer.setSize(window.innerWidth, window.innerHeight);
-            if (bloomPass) bloomPass.setSize(window.innerWidth / 2, window.innerHeight / 2);
+            if (bloomPass) bloomPass.setSize(window.innerWidth * currentBloomRes, window.innerHeight * currentBloomRes);
         });
     </script>
 </body>
