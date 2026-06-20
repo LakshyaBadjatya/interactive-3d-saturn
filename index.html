@@ -525,16 +525,22 @@
             else { openStreak++; fistStreak = 0; }
 
             if (fistStreak >= 3) {
-                // GRAB & ROTATE only — no zoom here, so a clenched fist holds the
-                // planet at a fixed size instead of bobbing in and out.
+                // GRAB & ROTATE only (no zoom, so the planet holds a fixed size).
+                // Drive rotation from the PALM (landmark 9), which stays steady when
+                // the hand is clenched — the index tip is curled and noisy, which was
+                // making the planet jitter. A dead-zone ignores tiny hand tremor and a
+                // gentler gain keeps the rotation smooth.
                 isExploded = false;
+                const palmX = 1 - lm[9].x, palmY = lm[9].y;
                 if (lastHandPos) {
-                    const ddx = (1 - indexTip.x) - (1 - lastHandPos.x);
-                    const ddy = indexTip.y - lastHandPos.y;
-                    saturn.rotation.y += ddx * 7; saturn.rotation.x += ddy * 7;
-                    rings.rotation.y += ddx * 7; rings.rotation.x += ddy * 7;
+                    let ddx = palmX - lastHandPos.x;
+                    let ddy = palmY - lastHandPos.y;
+                    if (Math.abs(ddx) < 0.004) ddx = 0;
+                    if (Math.abs(ddy) < 0.004) ddy = 0;
+                    saturn.rotation.y += ddx * 4; saturn.rotation.x += ddy * 4;
+                    rings.rotation.y += ddx * 4; rings.rotation.x += ddy * 4;
                 }
-                lastHandPos = indexTip;
+                lastHandPos = { x: palmX, y: palmY };
             } else if (openStreak >= 3) {
                 // OPEN HAND → scatter/follow, plus pinch-to-zoom (only while open).
                 const zoomDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
