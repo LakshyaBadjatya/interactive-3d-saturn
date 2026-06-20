@@ -211,8 +211,9 @@
         // --- Simple WebAudio sound effects (no external files needed) ---
         let audioCtx = null, muted = false;
 
-        // --- FPS tracking ---
+        // --- FPS tracking + auto-downgrade ---
         let frameCount = 0, fpsTime = 0;
+        let fpsSamples = 0, lowFpsSamples = 0;
 
 
         // =====================================================================
@@ -338,7 +339,7 @@
         // =====================================================================
         //  GRAPHICS QUALITY SWITCHING
         // =====================================================================
-        function setQuality(key) {
+        function setQuality(key, auto) {
             if (!QUALITY[key]) return;
             currentQuality = key;
             const q = QUALITY[key];
@@ -367,12 +368,61 @@
 
             const btn = document.getElementById('btn-gfx');
             if (btn) btn.textContent = 'GFX: ' + q.label;
-            showToast('🖥️ Graphics: ' + q.label);
+            try { localStorage.setItem('saturnGfx', key); } catch (e) {}  // remember the choice
+            lowFpsSamples = 0;   // give the new mode a fresh chance before auto-adjusting
+            showToast(auto ? ('⚡ Auto-set graphics to ' + q.label + ' for smoother performance')
+                           : ('🖥️ Graphics: ' + q.label));
         }
         function cycleQuality() {
             const order = ['low', 'mid', 'high'];
             setQuality(order[(order.indexOf(currentQuality) + 1) % order.length]);
         }
+
+
+        // =====================================================================
+        //  ONE-EURO SMOOTHING FILTER  (removes hand-tracking jitter)
+        //  Adaptive low-pass: heavy smoothing when the hand is still, light
+        //  smoothing when it moves fast — steady but still responsive.
+        // =====================================================================
+        class HandSmoother {
+            constructor(minCutoff = 1.5, beta = 0.05, dcutoff = 1.0) {
+                this.minCutoff = minCutoff; this.beta = beta; this.dcutoff = dcutoff;
+                this.xPrev = null; this.dxPrev = null; this.tPrev = 0;
+            }
+            reset() { this.xPrev = null; }
+            _alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+            smooth(landmarks, t) {
+                const n = landmarks.length;
+                if (this.xPrev === null) {
+                    this.xPrev = new Float32Array(n * 3); this.dxPrev = new Float32Array(n * 3);
+                    for (let i = 0; i < n; i++) {
+                        this.xPrev[i*3] = landmarks[i].x; this.xPrev[i*3+1] = landmarks[i].y; this.xPrev[i*3+2] = landmarks[i].z || 0;
+                    }
+                    this.tPrev = t; return landmarks;
+                }
+                const dt = Math.max((t - this.tPrev) / 1000, 1e-3);
+                const aD = this._alpha(this.dcutoff, dt);
+                const out = new Array(n);
+                for (let i = 0; i < n; i++) {
+                    const raw = [landmarks[i].x, landmarks[i].y, landmarks[i].z || 0];
+                    const o = {};
+                    for (let c = 0; c < 3; c++) {
+                        const idx = i * 3 + c;
+                        const dx = (raw[c] - this.xPrev[idx]) / dt;
+                        const dxHat = aD * dx + (1 - aD) * this.dxPrev[idx];
+                        const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+                        const a = this._alpha(cutoff, dt);
+                        const xHat = a * raw[c] + (1 - a) * this.xPrev[idx];
+                        this.xPrev[idx] = xHat; this.dxPrev[idx] = dxHat;
+                        o[c === 0 ? 'x' : c === 1 ? 'y' : 'z'] = xHat;
+                    }
+                    out[i] = o;
+                }
+                this.tPrev = t;
+                return out;
+            }
+        }
+        const handSmoothers = [new HandSmoother(), new HandSmoother()];
 
 
         // =====================================================================
@@ -494,8 +544,22 @@
             frameCount++;
             const now = performance.now();
             if (now - fpsTime >= 500) {
-                document.getElementById('fps').textContent = Math.round((frameCount * 1000) / (now - fpsTime)) + ' FPS';
+                const fps = Math.round((frameCount * 1000) / (now - fpsTime));
+                document.getElementById('fps').textContent = fps + ' FPS';
                 frameCount = 0; fpsTime = now;
+                maybeAutoDowngrade(fps);
+            }
+        }
+
+        // If the frame-rate stays low for a few seconds, drop one graphics level so
+        // the experience stays smooth on weaker machines. Only ever steps DOWN.
+        function maybeAutoDowngrade(fps) {
+            fpsSamples++;
+            if (fpsSamples < 6) return;                 // ~3s warm-up (model load, first frames)
+            if (fps > 0 && fps < 25) lowFpsSamples++; else lowFpsSamples = 0;
+            if (lowFpsSamples >= 6 && currentQuality !== 'low') {   // ~3s sustained under 25 FPS
+                const order = ['high', 'mid', 'low'];
+                setQuality(order[order.indexOf(currentQuality) + 1] || 'low', true);
             }
         }
 
@@ -510,7 +574,9 @@
         ];
 
         async function startApp() {
-            currentQuality = autoQuality();   // pick a starting quality for this device
+            // Use the saved preference if there is one, otherwise auto-pick for this device.
+            const saved = localStorage.getItem('saturnGfx');
+            currentQuality = (saved && QUALITY[saved]) ? saved : autoQuality();
             initThree();
             wireUpControls();
 
@@ -523,8 +589,12 @@
 
             hands.onResults((results) => {
                 if (loadingMsg) loadingMsg.style.display = 'none';
-                const allHands = results.multiHandLandmarks || [];
-                handActive = allHands.length > 0;
+                const rawHands = results.multiHandLandmarks || [];
+                handActive = rawHands.length > 0;
+                // Smooth the landmarks (One-Euro) and reset filters for hands that left.
+                const tNow = performance.now();
+                const allHands = rawHands.map((h, i) => handSmoothers[i].smooth(h, tNow));
+                for (let i = rawHands.length; i < handSmoothers.length; i++) handSmoothers[i].reset();
 
                 handGroups.forEach((hg, idx) => {
                     if (idx < allHands.length) {
